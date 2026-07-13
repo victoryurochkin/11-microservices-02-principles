@@ -1,77 +1,123 @@
 from __future__ import annotations
 
-import io
+import hashlib
+import hmac
 import os
-import uuid
+from datetime import datetime, timedelta, timezone
+from typing import Annotated
 
-import boto3
-from botocore.config import Config
-from botocore.exceptions import BotoCoreError, ClientError
-from fastapi import FastAPI, HTTPException, Request, status
-from PIL import Image, UnidentifiedImageError
+import jwt
+from fastapi import Depends, FastAPI, Header, HTTPException, status
+from pydantic import BaseModel, Field
 
-app = FastAPI(title="Uploader service", version="1.0.0")
+app = FastAPI(title="Security service", version="1.0.0")
 
-MINIO_ENDPOINT = os.getenv("MINIO_ENDPOINT", "http://minio:9000")
-MINIO_ACCESS_KEY = os.getenv("MINIO_ACCESS_KEY", "minioadmin")
-MINIO_SECRET_KEY = os.getenv("MINIO_SECRET_KEY", "minioadmin123")
-MINIO_BUCKET = os.getenv("MINIO_BUCKET", "images")
-MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_BYTES", "20971520"))
+JWT_SECRET = os.getenv("JWT_SECRET", "secret")
+JWT_ALGORITHM = "HS256"
+JWT_TTL_MINUTES = int(os.getenv("JWT_TTL_MINUTES", "60"))
 
-s3 = boto3.client(
-    "s3",
-    endpoint_url=MINIO_ENDPOINT,
-    aws_access_key_id=MINIO_ACCESS_KEY,
-    aws_secret_access_key=MINIO_SECRET_KEY,
-    region_name="us-east-1",
-    config=Config(signature_version="s3v4"),
-)
+
+def hash_password(password: str) -> str:
+    return hashlib.sha256(password.encode("utf-8")).hexdigest()
+
+
+# In-memory storage is intentionally used only for a local homework demo.
+users: dict[str, str] = {
+    "bob": hash_password("qwe123"),
+}
+
+
+class Credentials(BaseModel):
+    login: str = Field(min_length=3, max_length=64, pattern=r"^[A-Za-z0-9_.-]+$")
+    password: str = Field(min_length=6, max_length=128)
+
+
+class TokenResponse(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+    expires_in: int
+
+
+def unauthorized(detail: str = "invalid or missing bearer token") -> HTTPException:
+    return HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail=detail,
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+
+
+def extract_bearer_token(authorization: str | None) -> str:
+    if not authorization:
+        raise unauthorized()
+    scheme, separator, token = authorization.partition(" ")
+    if not separator or scheme.lower() != "bearer" or not token:
+        raise unauthorized()
+    return token
+
+
+def decode_token(authorization: str | None) -> str:
+    token = extract_bearer_token(authorization)
+    try:
+        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+    except jwt.PyJWTError as exc:
+        raise unauthorized("token validation failed") from exc
+
+    login = payload.get("sub")
+    if not isinstance(login, str) or login not in users:
+        raise unauthorized("unknown token subject")
+    return login
+
+
+def current_user(authorization: Annotated[str | None, Header()] = None) -> str:
+    return decode_token(authorization)
 
 
 @app.get("/health")
 def health() -> dict[str, str]:
-    return {"status": "ok", "service": "uploader"}
+    return {"status": "ok", "service": "security"}
 
 
-@app.post("/v1/upload", status_code=status.HTTP_201_CREATED)
-async def upload(request: Request) -> dict[str, str | int]:
-    raw = await request.body()
-    if not raw:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="empty request body")
-    if len(raw) > MAX_UPLOAD_BYTES:
-        raise HTTPException(status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, detail="file is too large")
+@app.post("/v1/user", status_code=status.HTTP_201_CREATED)
+def register(credentials: Credentials) -> dict[str, str]:
+    if credentials.login in users:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="user already exists")
+    users[credentials.login] = hash_password(credentials.password)
+    return {"login": credentials.login, "status": "registered"}
 
-    try:
-        with Image.open(io.BytesIO(raw)) as source:
-            source.verify()
-        with Image.open(io.BytesIO(raw)) as source:
-            image = source.convert("RGB")
-            output = io.BytesIO()
-            image.save(output, format="JPEG", quality=82, optimize=True)
-            payload = output.getvalue()
-    except (UnidentifiedImageError, OSError) as exc:
-        raise HTTPException(
-            status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
-            detail="uploaded data is not a supported image",
-        ) from exc
 
-    object_name = f"{uuid.uuid4()}.jpg"
-    try:
-        s3.put_object(
-            Bucket=MINIO_BUCKET,
-            Key=object_name,
-            Body=payload,
-            ContentType="image/jpeg",
-            ContentLength=len(payload),
-        )
-    except (BotoCoreError, ClientError) as exc:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="object storage is unavailable",
-        ) from exc
+@app.get("/v1/user")
+def get_user(login: Annotated[str, Depends(current_user)]) -> dict[str, str]:
+    return {"login": login}
 
-    return {
-        "object": object_name,
-        "url": f"/images/{object_name}",
-        "size": len(payload),
-    }
+
+@app.post("/v1/token", response_model=TokenResponse)
+def issue_token(credentials: Credentials) -> TokenResponse:
+    stored_hash = users.get(credentials.login)
+    supplied_hash = hash_password(credentials.password)
+    if stored_hash is None or not hmac.compare_digest(stored_hash, supplied_hash):
+        raise unauthorized("invalid login or password")
+
+    now = datetime.now(timezone.utc)
+    expires = now + timedelta(minutes=JWT_TTL_MINUTES)
+    token = jwt.encode(
+        {
+            "sub": credentials.login,
+            "iat": int(now.timestamp()),
+            "exp": int(expires.timestamp()),
+        },
+        JWT_SECRET,
+        algorithm=JWT_ALGORITHM,
+    )
+    return TokenResponse(
+        access_token=token,
+        expires_in=JWT_TTL_MINUTES * 60,
+    )
+
+
+@app.get("/v1/token/validation")
+@app.get("/v1/token/validation/", include_in_schema=False)
+def validate_token(
+    authorization: Annotated[str | None, Header()] = None,
+) -> dict[str, str | bool]:
+    login = decode_token(authorization)
+    return {"valid": True, "login": login}
